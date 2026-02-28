@@ -1,18 +1,20 @@
 """
 CORE Econ Book Crawler
 ======================
-Crawls books.core-econ.org and extracts chapter text as clean Markdown
-files suitable for importing into NotebookLM or other LLM tools.
+Crawls books.core-econ.org and extracts chapter content as clean Markdown
+or PDF files suitable for importing into NotebookLM or other LLM tools.
 
 Usage:
-    python crawler.py                          # crawl default (microeconomics)
-    python crawler.py --url URL                # crawl a custom contents page
-    python crawler.py --output-dir my_output   # specify output directory
-    python crawler.py --single-file            # merge all chapters into one file
-    python crawler.py --delay 2.0              # seconds between requests
+    python crawler.py                                # markdown (default)
+    python crawler.py --format pdf                   # PDF with images
+    python crawler.py --format pdf --single-file     # one merged PDF
+    python crawler.py --url URL                      # crawl a custom book
+    python crawler.py --output-dir my_output         # specify output dir
+    python crawler.py --delay 2.0                    # seconds between requests
 """
 
 import argparse
+import io
 import logging
 import re
 import sys
@@ -20,7 +22,6 @@ import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import html2text
 import requests
 from bs4 import BeautifulSoup
 
@@ -104,13 +105,9 @@ def discover_section_links(
     soup = BeautifulSoup(html, "html.parser")
     base_url = contents_url.rsplit("/", 1)[0] + "/"
 
-    # The contents page links to individual sections via <a> tags.
-    # We collect all internal links that point to .html pages under the same
-    # base path, excluding anchors to the same page and non-chapter assets.
     seen: set[str] = set()
     links: list[dict[str, str]] = []
 
-    # Identify the main content area (try common selectors)
     content_area = (
         soup.select_one("main")
         or soup.select_one("#content")
@@ -122,18 +119,15 @@ def discover_section_links(
     for a_tag in content_area.find_all("a", href=True):
         href: str = a_tag["href"]
 
-        # Skip pure anchors, external links, and non-html resources
         if href.startswith("#") or href.startswith("mailto:"):
             continue
 
         absolute = urljoin(contents_url, href).split("#")[0]
 
-        # Must stay within the same book directory
         if not absolute.startswith(base_url):
             continue
         if not absolute.endswith(".html"):
             continue
-        # Skip the contents page itself
         if absolute == contents_url:
             continue
 
@@ -149,39 +143,55 @@ def discover_section_links(
 
 
 # ---------------------------------------------------------------------------
-# Content extraction
+# HTML cleaning (shared by both exporters)
 # ---------------------------------------------------------------------------
-def _build_html2text() -> html2text.HTML2Text:
-    """Configure html2text for clean Markdown output."""
-    h = html2text.HTML2Text()
-    h.body_width = 0  # don't wrap lines
-    h.ignore_links = False
-    h.ignore_images = True
-    h.ignore_emphasis = False
-    h.skip_internal_links = True
-    h.inline_links = False  # use reference-style links
-    h.protect_links = True
-    h.wrap_links = False
-    return h
+NOISE_SELECTORS = (
+    "nav, header, footer, script, style, noscript, "
+    ".sidebar, .navigation, .nav, .menu, .breadcrumb, "
+    ".cookie-banner, .share-buttons, #cookie-notice"
+)
 
 
-def extract_page_content(html: str, url: str) -> str:
+def clean_html(html: str, page_url: str) -> BeautifulSoup:
     """
-    Extract the main textual content from a section page and return
-    clean Markdown.
+    Parse HTML, strip navigation chrome, and resolve relative URLs so
+    images and links work in both Markdown and PDF output.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove elements that add noise for LLM ingestion
-    for tag in soup.select(
-        "nav, header, footer, script, style, noscript, "
-        ".sidebar, .navigation, .nav, .menu, .breadcrumb, "
-        ".cookie-banner, .share-buttons, #cookie-notice"
-    ):
+    for tag in soup.select(NOISE_SELECTORS):
         tag.decompose()
 
-    # Find the main content container
-    main = (
+    # Resolve relative image src to absolute URLs
+    for img in soup.find_all("img", src=True):
+        img["src"] = urljoin(page_url, img["src"])
+
+    # Resolve relative srcset entries
+    for img in soup.find_all("img", srcset=True):
+        parts = []
+        for entry in img["srcset"].split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            tokens = entry.split()
+            tokens[0] = urljoin(page_url, tokens[0])
+            parts.append(" ".join(tokens))
+        img["srcset"] = ", ".join(parts)
+
+    # Resolve relative link hrefs
+    for a_tag in soup.find_all("a", href=True):
+        a_tag["href"] = urljoin(page_url, a_tag["href"])
+
+    # Resolve <link> stylesheet hrefs for PDF rendering
+    for link in soup.find_all("link", href=True):
+        link["href"] = urljoin(page_url, link["href"])
+
+    return soup
+
+
+def find_main_content(soup: BeautifulSoup):
+    """Return the main content element from a cleaned soup."""
+    return (
         soup.select_one("main")
         or soup.select_one("article")
         or soup.select_one("#content")
@@ -190,19 +200,112 @@ def extract_page_content(html: str, url: str) -> str:
         or soup.body
     )
 
+
+# ---------------------------------------------------------------------------
+# Markdown exporter
+# ---------------------------------------------------------------------------
+def _build_html2text():
+    import html2text
+
+    h = html2text.HTML2Text()
+    h.body_width = 0
+    h.ignore_links = False
+    h.ignore_images = True
+    h.ignore_emphasis = False
+    h.skip_internal_links = True
+    h.inline_links = False
+    h.protect_links = True
+    h.wrap_links = False
+    return h
+
+
+def extract_markdown(html: str, url: str) -> str:
+    """Extract main content as clean Markdown."""
+    soup = clean_html(html, url)
+    main = find_main_content(soup)
     if main is None:
         return ""
 
     converter = _build_html2text()
     markdown = converter.handle(str(main))
-
-    # Light clean-up: collapse excessive blank lines
     markdown = re.sub(r"\n{4,}", "\n\n\n", markdown)
     return markdown.strip()
 
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# PDF exporter
+# ---------------------------------------------------------------------------
+def extract_pdf_bytes(html: str, page_url: str) -> bytes | None:
+    """
+    Render a section page to a PDF byte string using WeasyPrint.
+    Preserves images, figures, and basic styling from the original page.
+    """
+    from weasyprint import HTML as WeasyHTML
+
+    soup = clean_html(html, page_url)
+
+    # Build a self-contained HTML document for WeasyPrint.
+    # Keep the original <head> (stylesheets, meta charset) but inject a
+    # base tag so relative resources resolve correctly.
+    head = soup.find("head")
+    if head is None:
+        head_html = ""
+    else:
+        # Remove any existing <base> to avoid conflicts
+        for base in head.find_all("base"):
+            base.decompose()
+        head_html = str(head)
+
+    main = find_main_content(soup)
+    if main is None:
+        return None
+
+    # Inject a small print-friendly stylesheet
+    print_css = """
+    <style>
+        body { font-family: serif; line-height: 1.6; margin: 2cm; color: #222; }
+        img { max-width: 100%; height: auto; }
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        td, th { border: 1px solid #ccc; padding: 0.4em 0.6em; }
+        h1, h2, h3 { margin-top: 1.2em; }
+        figure { margin: 1em 0; text-align: center; }
+        figcaption { font-size: 0.9em; color: #555; }
+        @page { margin: 2cm; }
+    </style>
+    """
+
+    doc_html = (
+        "<!DOCTYPE html>\n<html>\n"
+        f"<head>\n<base href=\"{page_url}\">\n"
+        f"<meta charset=\"utf-8\">\n{print_css}\n"
+        f"</head>\n<body>\n{main}\n</body>\n</html>"
+    )
+
+    try:
+        pdf_bytes = WeasyHTML(string=doc_html, base_url=page_url).write_pdf()
+        return pdf_bytes
+    except Exception as exc:
+        log.error("PDF rendering failed for %s: %s", page_url, exc)
+        return None
+
+
+def merge_pdfs(pdf_list: list[bytes]) -> bytes:
+    """Merge multiple PDF byte strings into one."""
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for pdf_bytes in pdf_list:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Filename / save helpers
 # ---------------------------------------------------------------------------
 def sanitize_filename(name: str) -> str:
     """Turn a section title into a safe filename."""
@@ -211,10 +314,9 @@ def sanitize_filename(name: str) -> str:
     return name[:120] or "untitled"
 
 
-def save_section(
+def save_markdown_section(
     output_dir: Path, index: int, title: str, url: str, content: str
 ) -> Path:
-    """Save a single section as a numbered Markdown file."""
     filename = f"{index:03d}-{sanitize_filename(title)}.md"
     path = output_dir / filename
     header = f"# {title}\n\nSource: {url}\n\n---\n\n"
@@ -222,8 +324,7 @@ def save_section(
     return path
 
 
-def save_merged(output_dir: Path, sections: list[dict]) -> Path:
-    """Merge all sections into a single Markdown file."""
+def save_merged_markdown(output_dir: Path, sections: list[dict]) -> Path:
     path = output_dir / "book-complete.md"
     parts: list[str] = []
     for sec in sections:
@@ -234,12 +335,29 @@ def save_merged(output_dir: Path, sections: list[dict]) -> Path:
     return path
 
 
+def save_pdf_section(
+    output_dir: Path, index: int, title: str, pdf_bytes: bytes
+) -> Path:
+    filename = f"{index:03d}-{sanitize_filename(title)}.pdf"
+    path = output_dir / filename
+    path.write_bytes(pdf_bytes)
+    return path
+
+
+def save_merged_pdf(output_dir: Path, pdf_list: list[bytes]) -> Path:
+    path = output_dir / "book-complete.pdf"
+    merged = merge_pdfs(pdf_list)
+    path.write_bytes(merged)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Main crawl loop
 # ---------------------------------------------------------------------------
 def crawl(
     contents_url: str,
     output_dir: str,
+    fmt: str,
     delay: float,
     single_file: bool,
 ) -> None:
@@ -249,6 +367,7 @@ def crawl(
 
     log.info("Contents URL : %s", contents_url)
     log.info("Output dir   : %s", out.resolve())
+    log.info("Format       : %s", fmt)
     log.info("Request delay: %.1fs", delay)
 
     # Step 1 – discover links
@@ -258,7 +377,10 @@ def crawl(
         sys.exit(1)
 
     # Step 2 – crawl each section
-    collected: list[dict] = []
+    count = 0
+    md_sections: list[dict] = []  # for markdown --single-file
+    pdf_parts: list[bytes] = []   # for pdf --single-file
+
     for i, link in enumerate(links, start=1):
         url = link["url"]
         title = link["title"]
@@ -269,31 +391,38 @@ def crawl(
             log.warning("Skipping %s (fetch failed)", url)
             continue
 
-        content = extract_page_content(html, url)
-        if not content:
-            log.warning("Skipping %s (no content extracted)", url)
-            continue
+        if fmt == "markdown":
+            content = extract_markdown(html, url)
+            if not content:
+                log.warning("Skipping %s (no content extracted)", url)
+                continue
+            path = save_markdown_section(out, i, title, url, content)
+            log.info("  -> saved %s (%d chars)", path.name, len(content))
+            md_sections.append({"title": title, "url": url, "content": content})
 
-        # Save individual file
-        path = save_section(out, i, title, url, content)
-        log.info("  -> saved %s (%d chars)", path.name, len(content))
+        else:  # pdf
+            pdf_bytes = extract_pdf_bytes(html, url)
+            if pdf_bytes is None:
+                log.warning("Skipping %s (PDF rendering failed)", url)
+                continue
+            path = save_pdf_section(out, i, title, pdf_bytes)
+            log.info("  -> saved %s (%.1f KB)", path.name, len(pdf_bytes) / 1024)
+            pdf_parts.append(pdf_bytes)
 
-        collected.append({"title": title, "url": url, "content": content})
-
+        count += 1
         if i < len(links):
             time.sleep(delay)
 
-    # Step 3 – optionally merge into one file
-    if single_file and collected:
-        merged = save_merged(out, collected)
-        log.info("Merged file: %s", merged)
+    # Step 3 – optionally merge
+    if single_file:
+        if fmt == "markdown" and md_sections:
+            merged = save_merged_markdown(out, md_sections)
+            log.info("Merged file: %s", merged)
+        elif fmt == "pdf" and pdf_parts:
+            merged = save_merged_pdf(out, pdf_parts)
+            log.info("Merged file: %s (%.1f MB)", merged, merged.stat().st_size / 1e6)
 
-    log.info(
-        "Done – crawled %d/%d sections into %s",
-        len(collected),
-        len(links),
-        out.resolve(),
-    )
+    log.info("Done – %s %d/%d sections into %s", fmt, count, len(links), out.resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +430,7 @@ def crawl(
 # ---------------------------------------------------------------------------
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Crawl a CORE Econ book and export clean Markdown for LLM use.",
+        description="Crawl a CORE Econ book and export as Markdown or PDF.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -311,9 +440,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Table-of-contents page URL (default: CORE Econ Microeconomics)",
     )
     parser.add_argument(
+        "--format",
+        choices=["markdown", "pdf"],
+        default="markdown",
+        dest="fmt",
+        help="Output format (default: markdown)",
+    )
+    parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory to save extracted Markdown files (default: %(default)s)",
+        help="Directory to save output files (default: %(default)s)",
     )
     parser.add_argument(
         "--delay",
@@ -324,7 +460,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--single-file",
         action="store_true",
-        help="Also produce a single merged Markdown file",
+        help="Also produce a single merged file (book-complete.md or .pdf)",
     )
     parser.add_argument(
         "--verbose",
@@ -342,6 +478,7 @@ def main(argv: list[str] | None = None) -> None:
     crawl(
         contents_url=args.url,
         output_dir=args.output_dir,
+        fmt=args.fmt,
         delay=args.delay,
         single_file=args.single_file,
     )
