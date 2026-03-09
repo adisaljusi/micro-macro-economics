@@ -14,8 +14,10 @@ Usage:
 """
 
 import argparse
+import base64
 import io
 import logging
+import mimetypes
 import re
 import sys
 import time
@@ -152,21 +154,57 @@ NOISE_SELECTORS = (
 )
 
 
-def clean_html(html: str, page_url: str) -> BeautifulSoup:
+def _download_as_data_uri(session: requests.Session, url: str) -> str | None:
+    """Download a resource and return it as a base64 data URI."""
+    try:
+        resp = session.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.debug("Failed to download image %s: %s", url, exc)
+        return None
+
+    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+    if not content_type:
+        content_type = mimetypes.guess_type(url)[0] or "application/octet-stream"
+
+    b64 = base64.b64encode(resp.content).decode("ascii")
+    return f"data:{content_type};base64,{b64}"
+
+
+def clean_html(
+    html: str, page_url: str, session: requests.Session | None = None
+) -> BeautifulSoup:
     """
     Parse HTML, strip navigation chrome, and resolve relative URLs so
     images and links work in both Markdown and PDF output.
+
+    When *session* is provided, images are downloaded using our requests
+    session and embedded as base64 data URIs.  This guarantees images
+    appear in PDFs — WeasyPrint's own fetcher often gets blocked by
+    servers that reject its User-Agent or require cookies.
     """
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup.select(NOISE_SELECTORS):
         tag.decompose()
 
-    # Resolve relative image src to absolute URLs
+    # Process images: resolve URLs and optionally embed as data URIs
     for img in soup.find_all("img", src=True):
-        img["src"] = urljoin(page_url, img["src"])
+        absolute_src = urljoin(page_url, img["src"])
 
-    # Resolve relative srcset entries
+        if session is not None:
+            data_uri = _download_as_data_uri(session, absolute_src)
+            if data_uri:
+                img["src"] = data_uri
+                # srcset is irrelevant once we've embedded the image
+                if img.get("srcset"):
+                    del img["srcset"]
+                continue
+
+        # Fallback: just resolve to absolute URL
+        img["src"] = absolute_src
+
+    # Resolve remaining srcset entries (only when images weren't embedded)
     for img in soup.find_all("img", srcset=True):
         parts = []
         for entry in img["srcset"].split(","):
@@ -235,14 +273,17 @@ def extract_markdown(html: str, url: str) -> str:
 # ---------------------------------------------------------------------------
 # PDF exporter
 # ---------------------------------------------------------------------------
-def extract_pdf_bytes(html: str, page_url: str) -> bytes | None:
+def extract_pdf_bytes(
+    html: str, page_url: str, session: requests.Session | None = None
+) -> bytes | None:
     """
     Render a section page to a PDF byte string using WeasyPrint.
-    Preserves images, figures, and basic styling from the original page.
+    Images are pre-downloaded via our requests session and embedded as
+    base64 data URIs so they always appear in the output PDF.
     """
     from weasyprint import HTML as WeasyHTML
 
-    soup = clean_html(html, page_url)
+    soup = clean_html(html, page_url, session=session)
 
     # Build a self-contained HTML document for WeasyPrint.
     # Keep the original <head> (stylesheets, meta charset) but inject a
@@ -401,7 +442,7 @@ def crawl(
             md_sections.append({"title": title, "url": url, "content": content})
 
         else:  # pdf
-            pdf_bytes = extract_pdf_bytes(html, url)
+            pdf_bytes = extract_pdf_bytes(html, url, session=session)
             if pdf_bytes is None:
                 log.warning("Skipping %s (PDF rendering failed)", url)
                 continue
