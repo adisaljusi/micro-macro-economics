@@ -27,9 +27,6 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
 DEFAULT_CONTENTS_URL = (
     "https://books.core-econ.org/the-economy/microeconomics/0-3-contents.html"
 )
@@ -51,9 +48,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
 def make_session() -> requests.Session:
     """Create a requests session with sensible defaults."""
     session = requests.Session()
@@ -89,9 +83,6 @@ def fetch(session: requests.Session, url: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Link discovery
-# ---------------------------------------------------------------------------
 def discover_section_links(
     session: requests.Session, contents_url: str
 ) -> list[dict[str, str]]:
@@ -144,9 +135,6 @@ def discover_section_links(
     return links
 
 
-# ---------------------------------------------------------------------------
-# HTML cleaning (shared by both exporters)
-# ---------------------------------------------------------------------------
 NOISE_SELECTORS = (
     "nav, header, footer, script, style, "
     ".sidebar, .navigation, .nav, .menu, .breadcrumb, "
@@ -255,9 +243,6 @@ def find_main_content(soup: BeautifulSoup):
     )
 
 
-# ---------------------------------------------------------------------------
-# Markdown exporter
-# ---------------------------------------------------------------------------
 def _build_html2text():
     import html2text
 
@@ -286,9 +271,6 @@ def extract_markdown(html: str, url: str) -> str:
     return markdown.strip()
 
 
-# ---------------------------------------------------------------------------
-# PDF exporter
-# ---------------------------------------------------------------------------
 def extract_pdf_bytes(
     html: str, page_url: str, session: requests.Session | None = None
 ) -> bytes | None:
@@ -365,9 +347,6 @@ def merge_pdfs(pdf_list: list[bytes]) -> bytes:
     return buf.getvalue()
 
 
-# ---------------------------------------------------------------------------
-# Filename / save helpers
-# ---------------------------------------------------------------------------
 def sanitize_filename(name: str) -> str:
     """Turn a section title into a safe filename."""
     name = re.sub(r"[^\w\s\-.]", "", name)
@@ -412,9 +391,6 @@ def save_merged_pdf(output_dir: Path, pdf_list: list[bytes]) -> Path:
     return path
 
 
-# ---------------------------------------------------------------------------
-# Main crawl loop
-# ---------------------------------------------------------------------------
 def crawl(
     contents_url: str,
     output_dir: str,
@@ -486,9 +462,6 @@ def crawl(
     log.info("Done – %s %d/%d sections into %s", fmt, count, len(links), out.resolve())
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Crawl a CORE Econ book and export as Markdown or PDF.",
