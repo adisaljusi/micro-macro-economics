@@ -148,10 +148,13 @@ def discover_section_links(
 # HTML cleaning (shared by both exporters)
 # ---------------------------------------------------------------------------
 NOISE_SELECTORS = (
-    "nav, header, footer, script, style, noscript, "
+    "nav, header, footer, script, style, "
     ".sidebar, .navigation, .nav, .menu, .breadcrumb, "
     ".cookie-banner, .share-buttons, #cookie-notice"
 )
+# NOTE: <noscript> is intentionally NOT stripped — lazy-loading frameworks
+# (like the Electric Book toolkit used by core-econ.org) place fallback
+# <img> tags inside <noscript> elements.
 
 
 def _download_as_data_uri(session: requests.Session, url: str) -> str | None:
@@ -187,6 +190,19 @@ def clean_html(
 
     for tag in soup.select(NOISE_SELECTORS):
         tag.decompose()
+
+    # Unwrap <noscript> tags so their content (often lazy-load fallback
+    # images) becomes part of the visible DOM.
+    for noscript in soup.find_all("noscript"):
+        noscript.unwrap()
+
+    # Promote data-src / data-lazy-src to src for lazy-loaded images
+    for img in soup.find_all("img"):
+        if not img.get("src") or img["src"].startswith("data:image/gif"):
+            for attr in ("data-src", "data-lazy-src", "data-original"):
+                if img.get(attr):
+                    img["src"] = img[attr]
+                    break
 
     # Process images: resolve URLs and optionally embed as data URIs
     for img in soup.find_all("img", src=True):
@@ -281,6 +297,10 @@ def extract_pdf_bytes(
     Images are pre-downloaded via our requests session and embedded as
     base64 data URIs so they always appear in the output PDF.
     """
+    # Silence noisy WeasyPrint / fontTools subsetting logs
+    for noisy in ("weasyprint", "fontTools", "fontTools.subset"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     from weasyprint import HTML as WeasyHTML
 
     soup = clean_html(html, page_url, session=session)
